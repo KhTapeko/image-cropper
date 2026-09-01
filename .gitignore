@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv-gpu/
+GEN_0_Hoshimachi_Suisei/
+.agents/
+docs/agents/
+AGENTS.md
+skills-lock.json
+run-gpu.bat
+
+input/*
+!input/.gitkeep
+
+output/*
+!output/.gitkeep
