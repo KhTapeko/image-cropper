@@ -11,10 +11,13 @@ from image_cropper.core import (
     GifAnimation,
     UnsupportedAnimatedImageError,
     composite_transparency_for_detection,
+    estimate_output_bytes,
     gif_sample_indices,
     load_gif_animation,
     load_oriented_image,
     mask_to_suggested_crop,
+    output_size_for_crop,
+    resize_image_high_quality,
     resolve_gif_crop,
     save_cropped_gif_atomic,
     save_cropped_image,
@@ -41,6 +44,31 @@ class CropBoxTests(unittest.TestCase):
         self.assertEqual(box.resize_corner("w", 10, 50, 100, 100), CropBox(10, 20, 80, 80))
         self.assertEqual(box.resize_corner("e", 90, 50, 100, 100), CropBox(20, 20, 90, 80))
 
+
+class OutputScalingTests(unittest.TestCase):
+    def test_output_size_rounds_half_up_and_never_reaches_zero(self) -> None:
+        self.assertEqual(output_size_for_crop(CropBox(0, 0, 333, 5), 50), (167, 3))
+        self.assertEqual(output_size_for_crop(CropBox(0, 0, 1, 1), 50), (1, 1))
+        self.assertEqual(output_size_for_crop(CropBox(0, 0, 7, 9), 200), (14, 18))
+
+    def test_output_size_rejects_non_integer_or_out_of_range_percent(self) -> None:
+        for invalid in (49, 201, 100.0, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    output_size_for_crop(CropBox(0, 0, 10, 10), invalid)  # type: ignore[arg-type]
+
+    def test_output_size_estimate_uses_actual_output_pixel_ratio(self) -> None:
+        self.assertEqual(estimate_output_bytes(4_000_000, (2000, 1000), (1500, 750)), 2_250_000)
+
+    def test_transparent_resize_avoids_dark_color_fringe(self) -> None:
+        image = Image.new("RGBA", (3, 1), (0, 0, 0, 0))
+        image.putpixel((1, 0), (255, 255, 255, 255))
+        resized = resize_image_high_quality(image, (9, 1))
+        translucent_pixels = [
+            pixel for pixel in resized.get_flattened_data() if 0 < pixel[3] < 255
+        ]
+        self.assertTrue(translucent_pixels)
+        self.assertTrue(all(min(pixel[:3]) >= 250 for pixel in translucent_pixels))
 
 class MaskSuggestionTests(unittest.TestCase):
     def test_adds_three_percent_padding_and_clamps(self) -> None:
@@ -212,6 +240,22 @@ class ImageSavingTests(unittest.TestCase):
                 self.assertEqual(result.size, (11, 10))
                 self.assertEqual(result.tobytes(), image.crop(box.as_tuple()).tobytes())
 
+    def test_png_crop_can_be_resized_with_alpha(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            output = root / "output.png"
+            self._pattern().save(source)
+            save_cropped_image(
+                source,
+                output,
+                CropBox(3, 2, 14, 12),
+                scale_percent=150,
+            )
+            with Image.open(output) as result:
+                self.assertEqual(result.mode, "RGBA")
+                self.assertEqual(result.size, (17, 15))
+
     def test_jpeg_preserves_quantization_tables(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -220,9 +264,14 @@ class ImageSavingTests(unittest.TestCase):
             self._pattern().convert("RGB").save(source, quality=87, subsampling=1)
             with Image.open(source) as before:
                 expected_tables = before.quantization
-            save_cropped_image(source, output, CropBox(2, 3, 18, 14))
+            save_cropped_image(
+                source,
+                output,
+                CropBox(2, 3, 18, 14),
+                scale_percent=50,
+            )
             with Image.open(output) as result:
-                self.assertEqual(result.size, (16, 11))
+                self.assertEqual(result.size, (8, 6))
                 self.assertEqual(result.quantization, expected_tables)
 
     def test_webp_lossless_crop_has_identical_decoded_pixels(self) -> None:
@@ -235,11 +284,31 @@ class ImageSavingTests(unittest.TestCase):
             image = self._pattern()
             image.save(source, format="WEBP", lossless=True)
             box = CropBox(1, 1, 17, 15)
-            save_cropped_image(source, output, box)
+            save_cropped_image(source, output, box, scale_percent=200)
             with Image.open(source) as decoded_source, Image.open(output) as result:
-                expected = decoded_source.crop(box.as_tuple()).convert("RGBA")
+                expected = resize_image_high_quality(
+                    decoded_source.crop(box.as_tuple()).convert("RGBA"),
+                    (32, 28),
+                )
                 self.assertEqual(result.size, expected.size)
                 self.assertEqual(result.convert("RGBA").tobytes(), expected.tobytes())
+
+    def test_png_resize_preserves_source_dpi(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            output = root / "output.png"
+            self._pattern().save(source, dpi=(144, 144))
+            save_cropped_image(
+                source,
+                output,
+                CropBox(0, 0, 20, 16),
+                scale_percent=50,
+            )
+            with Image.open(output) as result:
+                self.assertEqual(result.size, (10, 8))
+                self.assertAlmostEqual(result.info["dpi"][0], 144, delta=0.1)
+                self.assertAlmostEqual(result.info["dpi"][1], 144, delta=0.1)
 
 
 class GifAnimationTests(unittest.TestCase):
@@ -293,6 +362,23 @@ class GifAnimationTests(unittest.TestCase):
             self.assertEqual(decoded[0].getpixel((0, 0)), (255, 0, 0, 255))
             self.assertEqual(decoded[0].getpixel((5, 3))[3], 0)
             self.assertEqual(decoded[2].getpixel((5, 0)), (0, 255, 0, 255))
+
+    def test_gif_resize_keeps_all_playback_metadata(self) -> None:
+        animation = self._animation_with_duplicate_frame()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "scaled.gif"
+            save_cropped_gif_atomic(
+                animation,
+                output,
+                CropBox(1, 1, 7, 5),
+                scale_percent=150,
+            )
+            loaded = load_gif_animation(output)
+            self.assertEqual(loaded.size, (9, 6))
+            self.assertEqual(loaded.frame_count, 3)
+            self.assertEqual(loaded.durations, (30, 40, 50))
+            self.assertEqual(loaded.disposals, (1, 1, 1))
+            self.assertEqual(loaded.loop, 2)
 
     def test_opaque_gif_does_not_reduce_a_256_color_frame(self) -> None:
         frame = Image.new("RGBA", (16, 16))

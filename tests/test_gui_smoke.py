@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from image_cropper.core import CropBox, GifAnimation
-from image_cropper.gui import ImageCropperApp, shade_outside_crop
+from image_cropper.gui import ImageCropperApp, format_file_size, shade_outside_crop
 
 
 class OutsideShadeTests(unittest.TestCase):
@@ -33,7 +33,144 @@ class OutsideShadeTests(unittest.TestCase):
         self.assertEqual(shaded.getpixel((2, 2)), (120, 100, 80, 255))
 
 
+class FileSizeFormattingTests(unittest.TestCase):
+    def test_uses_kb_below_one_mb_and_mb_at_or_above_it(self) -> None:
+        self.assertEqual(format_file_size(1), "1 KB")
+        self.assertEqual(format_file_size(8192), "8 KB")
+        self.assertEqual(format_file_size(3 * 1024 * 1024 + 200_000), "3.19 MB")
+
+
 class GuiSmokeTests(unittest.TestCase):
+    def test_loading_each_image_resets_scale_to_one_hundred_percent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            Image.new("RGB", (20, 10)).save(source)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.paths = [source]
+                app.scale_percent_var.set("180")
+                with patch.object(app, "_start_static_detection"):
+                    app._load_next()
+                self.assertEqual(app.scale_percent_var.get(), "100")
+                self.assertEqual(str(app.scale_spinbox.cget("state")), "disabled")
+            finally:
+                root.destroy()
+
+    def test_scale_control_updates_output_summary_and_rejects_invalid_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            source.write_bytes(b"x" * 8192)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = source
+                app.current_image = Image.new("RGBA", (100, 50))
+                app.crop_box = CropBox(10, 10, 70, 40)
+                app._interaction_ready = True
+                app._set_scale_control_enabled(True)
+                app.scale_percent_var.set("150")
+                self.assertIn("倍率 150%", app.output_info_label.cget("text"))
+                self.assertIn("輸出 90 × 45", app.output_info_label.cget("text"))
+                self.assertIn("來源 8 KB", app.output_info_label.cget("text"))
+                self.assertEqual(str(app.confirm_button.cget("state")), "normal")
+
+                app.scale_percent_var.set("49")
+                self.assertIn("50～200", app.output_info_label.cget("text"))
+                self.assertEqual(str(app.confirm_button.cget("state")), "disabled")
+            finally:
+                root.destroy()
+
+    def test_static_save_failure_keeps_current_image_and_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            Image.new("RGB", (20, 10)).save(source)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = source
+                app.current_image = Image.new("RGB", (20, 10))
+                app.crop_box = CropBox(0, 0, 20, 10)
+                app._interaction_ready = True
+                app.scale_percent_var.set("180")
+                app._set_scale_control_enabled(True)
+                with (
+                    patch("image_cropper.gui.save_cropped_image", side_effect=OSError("disk full")),
+                    patch("image_cropper.gui.messagebox.showerror"),
+                ):
+                    app._confirm_crop()
+                self.assertEqual(app.index, 0)
+                self.assertEqual(app.scale_percent_var.get(), "180")
+                self.assertTrue(app._interaction_ready)
+                self.assertEqual(str(app.scale_spinbox.cget("state")), "normal")
+                self.assertEqual(str(app.confirm_button.cget("state")), "normal")
+            finally:
+                root.destroy()
+
+    def test_static_save_passes_valid_scale_to_core(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            Image.new("RGB", (20, 10)).save(source)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = source
+                app.current_image = Image.new("RGB", (20, 10))
+                app.crop_box = CropBox(1, 1, 19, 9)
+                app._interaction_ready = True
+                app.scale_percent_var.set("150")
+                app._set_scale_control_enabled(True)
+                with (
+                    patch("image_cropper.gui.save_cropped_image") as save,
+                    patch.object(root, "after") as after,
+                ):
+                    app._confirm_crop()
+                save.assert_called_once_with(
+                    source,
+                    Path(directory) / "output" / "sample.png",
+                    CropBox(1, 1, 19, 9),
+                    scale_percent=150,
+                )
+                self.assertEqual(app.success_count, 1)
+                self.assertEqual(app.index, 1)
+                after.assert_called_once_with(1, app._load_next)
+            finally:
+                root.destroy()
+
+    def test_gif_save_failure_keeps_scale_and_restarts_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = Path(directory) / "sample.gif"
+                app.current_animation = GifAnimation(
+                    frames=(Image.new("RGBA", (20, 10)), Image.new("RGBA", (20, 10))),
+                    durations=(30, 40),
+                    disposals=(1, 1),
+                    loop=0,
+                )
+                app.current_image = app.current_animation.frames[0]
+                app.crop_box = CropBox(0, 0, 20, 10)
+                app.scale_percent_var.set("180")
+                app._saving = True
+                with (
+                    patch("image_cropper.gui.messagebox.showerror"),
+                    patch.object(app, "_schedule_next_animation_frame") as restart_preview,
+                ):
+                    app._finish_gif_save(app._generation, "disk full")
+                self.assertEqual(app.index, 0)
+                self.assertEqual(app.scale_percent_var.get(), "180")
+                self.assertTrue(app._interaction_ready)
+                self.assertEqual(str(app.scale_spinbox.cget("state")), "normal")
+                restart_preview.assert_called_once_with()
+            finally:
+                root.destroy()
+
     def test_empty_input_shows_completion_screen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = tk.Tk()

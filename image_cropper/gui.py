@@ -23,13 +23,17 @@ from .config import (
     SMALL_BORDER_COMPONENT_MAX_AREA_RATIO,
 )
 from .core import (
+    MAX_SCALE_PERCENT,
+    MIN_SCALE_PERCENT,
     CropBox,
     GifAnimation,
     composite_transparency_for_detection,
+    estimate_output_bytes,
     gif_sample_indices,
     load_gif_animation,
     load_oriented_image,
     mask_to_suggested_crop,
+    output_size_for_crop,
     resolve_gif_crop,
     save_cropped_gif_atomic,
     save_cropped_image,
@@ -55,6 +59,15 @@ def shade_outside_crop(
     overlay_draw = ImageDraw.Draw(overlay)
     overlay_draw.rectangle((left, top, right - 1, bottom - 1), fill=(0, 0, 0, 0))
     return Image.alpha_composite(display, overlay)
+
+
+def format_file_size(byte_count: int) -> str:
+    """Format a byte count as readable KB or MB text."""
+
+    if byte_count < 1024 * 1024:
+        kilobytes = 0 if byte_count <= 0 else max(1, (byte_count + 512) // 1024)
+        return f"{kilobytes} KB"
+    return f"{byte_count / (1024 * 1024):.2f} MB"
 
 
 class ImageCropperApp:
@@ -152,9 +165,94 @@ class ImageCropperApp:
             font=("Microsoft JhengHei UI", 10),
             anchor="w",
         )
-        self.status_label.pack(side="left", fill="x", expand=True)
-        self.confirm_button = ttk.Button(footer, text="確認裁切", command=self._confirm_crop, state="disabled")
+        self.status_label.pack(fill="x")
+
+        controls = ttk.Frame(footer)
+        controls.pack(fill="x", pady=(6, 0))
+        self.output_info_label = ttk.Label(
+            controls,
+            text="",
+            font=("Microsoft JhengHei UI", 9),
+            anchor="w",
+        )
+        self.output_info_label.pack(side="left", fill="x", expand=True)
+        self.confirm_button = ttk.Button(
+            controls,
+            text="確認裁切與縮放",
+            command=self._confirm_crop,
+            state="disabled",
+        )
         self.confirm_button.pack(side="right", ipadx=16, ipady=5)
+        ttk.Label(controls, text="%").pack(side="right", padx=(3, 10))
+        self.scale_percent_var = tk.StringVar(self.root, "100")
+        self.scale_spinbox = ttk.Spinbox(
+            controls,
+            from_=MIN_SCALE_PERCENT,
+            to=MAX_SCALE_PERCENT,
+            increment=10,
+            width=5,
+            justify="right",
+            textvariable=self.scale_percent_var,
+            state="disabled",
+        )
+        self.scale_spinbox.pack(side="right")
+        ttk.Label(controls, text="倍率").pack(side="right", padx=(10, 5))
+        self.scale_percent_var.trace_add("write", self._on_scale_changed)
+
+    def _parse_scale_percent(self) -> int | None:
+        text = self.scale_percent_var.get().strip()
+        if not text.isascii() or not text.isdecimal():
+            return None
+        value = int(text)
+        if not MIN_SCALE_PERCENT <= value <= MAX_SCALE_PERCENT:
+            return None
+        return value
+
+    def _on_scale_changed(self, *_args: object) -> None:
+        self._update_output_info()
+
+    def _set_scale_control_enabled(self, enabled: bool) -> None:
+        self.scale_spinbox.configure(state="normal" if enabled else "disabled")
+        self._update_output_info()
+
+    def _update_output_info(self) -> None:
+        if (
+            self.current_path is None
+            or self.current_image is None
+            or self.crop_box is None
+            or not self._interaction_ready
+        ):
+            self.output_info_label.configure(text="")
+            return
+
+        scale_percent = self._parse_scale_percent()
+        if scale_percent is None:
+            self.output_info_label.configure(
+                text=f"倍率必須是 {MIN_SCALE_PERCENT}～{MAX_SCALE_PERCENT} 的整數"
+            )
+            self.confirm_button.configure(state="disabled")
+            return
+
+        box = self.crop_box.clamp(*self.current_image.size)
+        output_size = output_size_for_crop(box, scale_percent)
+        try:
+            source_bytes = self.current_path.stat().st_size
+        except OSError:
+            source_bytes = 0
+        estimated_bytes = estimate_output_bytes(
+            source_bytes,
+            self.current_image.size,
+            output_size,
+        )
+        self.output_info_label.configure(
+            text=(
+                f"倍率 {scale_percent}%｜輸出 {output_size[0]} × {output_size[1]}｜"
+                f"來源 {format_file_size(source_bytes)}｜"
+                f"預估輸出約 {format_file_size(estimated_bytes)}"
+            )
+        )
+        if not self._saving and not self.completed:
+            self.confirm_button.configure(state="normal")
 
     def _initialize_detector(self) -> None:
         try:
@@ -222,6 +320,8 @@ class ImageCropperApp:
         self._pending_detection = None
         self._interaction_ready = False
         self._saving = False
+        self.scale_percent_var.set("100")
+        self._set_scale_control_enabled(False)
         self.confirm_button.configure(state="disabled")
         self.file_label.configure(text=self.current_path.name)
         self.progress_label.configure(text=f"{self.index + 1} / {len(self.paths)}")
@@ -455,9 +555,9 @@ class ImageCropperApp:
                 self.status_label.configure(text="未能可靠辨識人物，請手動調整裁切框")
         else:
             self.crop_box = suggestion
-            self.status_label.configure(text="請移動或拖曳四邊、四角調整裁切框，確認後立即儲存")
+            self.status_label.configure(text="請調整裁切框與輸出倍率，確認後立即儲存")
         self._interaction_ready = True
-        self.confirm_button.configure(state="normal")
+        self._set_scale_control_enabled(True)
         self._render_current()
 
     def _show_gif_detection_progress(
@@ -516,10 +616,10 @@ class ImageCropperApp:
             )
         else:
             self.status_label.configure(
-                text="請移動或拖曳四邊、四角調整共用裁切框，確認後立即儲存"
+                text="請調整共用裁切框與輸出倍率，確認後立即儲存"
             )
         self._interaction_ready = True
-        self.confirm_button.configure(state="normal")
+        self._set_scale_control_enabled(True)
         self._render_current()
         self._schedule_next_animation_frame()
 
@@ -528,6 +628,7 @@ class ImageCropperApp:
             return
         self._cancel_animation_preview()
         self._interaction_ready = False
+        self._set_scale_control_enabled(False)
         self.confirm_button.configure(state="disabled")
         self.failures.append((self.current_path.name, f"GPU 辨識失敗：{reason}"))
         messagebox.showerror(
@@ -565,6 +666,7 @@ class ImageCropperApp:
         self.completed = True
         self._pending_detection = None
         self._interaction_ready = False
+        self._set_scale_control_enabled(False)
         self.current_path = None
         self.current_image = None
         self.current_animation = None
@@ -735,6 +837,7 @@ class ImageCropperApp:
                 self.MIN_CROP_PIXELS,
             )
         self._render_current()
+        self._update_output_info()
 
     def _on_pointer_up(self, _event: tk.Event) -> None:
         self._drag_mode = None
@@ -761,6 +864,10 @@ class ImageCropperApp:
     def _confirm_crop(self) -> None:
         if self.current_path is None or self.crop_box is None:
             return
+        scale_percent = self._parse_scale_percent()
+        if scale_percent is None:
+            self._update_output_info()
+            return
         output_path = self.output_directory / self.current_path.name
         if output_path.exists() and not messagebox.askyesno(
             "確認覆寫",
@@ -770,21 +877,34 @@ class ImageCropperApp:
             return
 
         if self.current_animation is not None:
-            self._start_gif_save(output_path)
+            self._start_gif_save(output_path, scale_percent)
             return
 
+        self._saving = True
+        self._interaction_ready = False
+        self._set_scale_control_enabled(False)
         self.confirm_button.configure(state="disabled")
         try:
-            save_cropped_image(self.current_path, output_path, self.crop_box)
+            save_cropped_image(
+                self.current_path,
+                output_path,
+                self.crop_box,
+                scale_percent=scale_percent,
+            )
         except Exception as exc:
-            self.failures.append((self.current_path.name, f"儲存失敗：{exc}"))
             messagebox.showerror("儲存失敗", f"無法儲存 {self.current_path.name}\n\n{exc}")
+            self._saving = False
+            self._interaction_ready = True
+            self.status_label.configure(text="儲存失敗；請確認設定後再次嘗試")
+            self._set_scale_control_enabled(True)
+            return
         else:
             self.success_count += 1
+        self._saving = False
         self.index += 1
         self.root.after(1, self._load_next)
 
-    def _start_gif_save(self, output_path: Path) -> None:
+    def _start_gif_save(self, output_path: Path, scale_percent: int) -> None:
         assert self.current_animation is not None
         assert self.crop_box is not None
         generation = self._generation
@@ -793,6 +913,7 @@ class ImageCropperApp:
         self._cancel_animation_preview()
         self._saving = True
         self._interaction_ready = False
+        self._set_scale_control_enabled(False)
         self.confirm_button.configure(state="disabled")
         self.status_label.configure(
             text=f"正在儲存 GIF：0 / {animation.frame_count} 個影格"
@@ -804,6 +925,7 @@ class ImageCropperApp:
                     animation,
                     output_path,
                     crop_box,
+                    scale_percent=scale_percent,
                     progress_callback=lambda completed, total: self._worker_events.put(
                         ("gif_save_progress", generation, completed, total)
                     ),
@@ -824,13 +946,16 @@ class ImageCropperApp:
         self._saving = False
         assert self.current_path is not None
         if error is not None:
-            self.failures.append((self.current_path.name, f"儲存失敗：{error}"))
             messagebox.showerror(
                 "儲存失敗",
                 f"無法儲存 {self.current_path.name}\n\n{error}",
             )
-        else:
-            self.success_count += 1
+            self._interaction_ready = True
+            self.status_label.configure(text="GIF 儲存失敗；請確認設定後再次嘗試")
+            self._set_scale_control_enabled(True)
+            self._schedule_next_animation_frame()
+            return
+        self.success_count += 1
         self.index += 1
         self.root.after(1, self._load_next)
 
@@ -842,6 +967,7 @@ class ImageCropperApp:
         self.current_animation = None
         self.crop_box = None
         self._interaction_ready = False
+        self._set_scale_control_enabled(False)
         self.canvas.delete("all")
         self.file_label.configure(text="全部處理完成")
         self.progress_label.configure(text="")

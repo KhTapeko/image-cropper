@@ -13,6 +13,8 @@ from scipy import ndimage
 
 
 SUPPORTED_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+MIN_SCALE_PERCENT = 50
+MAX_SCALE_PERCENT = 200
 
 
 class UnsupportedAnimatedImageError(ValueError):
@@ -107,6 +109,54 @@ class GifAnimation:
     @property
     def frame_count(self) -> int:
         return len(self.frames)
+
+
+def output_size_for_crop(crop_box: CropBox, scale_percent: int) -> tuple[int, int]:
+    """Return the integer output size after applying a validated percentage."""
+
+    if (
+        isinstance(scale_percent, bool)
+        or not isinstance(scale_percent, int)
+        or not MIN_SCALE_PERCENT <= scale_percent <= MAX_SCALE_PERCENT
+    ):
+        raise ValueError(
+            f"輸出倍率必須是 {MIN_SCALE_PERCENT}～{MAX_SCALE_PERCENT} 的整數"
+        )
+    return (
+        max(1, (crop_box.width * scale_percent + 50) // 100),
+        max(1, (crop_box.height * scale_percent + 50) // 100),
+    )
+
+
+def estimate_output_bytes(
+    source_bytes: int,
+    source_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> int:
+    """Estimate encoded size from the source/output pixel-count ratio."""
+
+    source_pixels = source_size[0] * source_size[1]
+    if source_pixels <= 0 or source_bytes <= 0:
+        return 0
+    output_pixels = max(1, output_size[0] * output_size[1])
+    return max(1, (source_bytes * output_pixels + source_pixels // 2) // source_pixels)
+
+
+def resize_image_high_quality(
+    image: Image.Image,
+    output_size: tuple[int, int],
+) -> Image.Image:
+    """Resize with LANCZOS and premultiplied alpha for clean transparent edges."""
+
+    if image.size == output_size:
+        return image.copy()
+    if image.mode in {"RGBA", "LA", "PA", "P"}:
+        premultiplied = image.convert("RGBA").convert("RGBa")
+        return premultiplied.resize(
+            output_size,
+            Image.Resampling.LANCZOS,
+        ).convert("RGBA")
+    return image.resize(output_size, Image.Resampling.LANCZOS)
 
 
 def mask_to_suggested_crop(
@@ -387,8 +437,14 @@ def load_gif_animation(path: Path) -> GifAnimation:
     )
 
 
-def save_cropped_image(source_path: Path, output_path: Path, crop_box: CropBox) -> None:
-    """Crop without resizing and preserve useful source metadata when supported."""
+def save_cropped_image(
+    source_path: Path,
+    output_path: Path,
+    crop_box: CropBox,
+    *,
+    scale_percent: int = 100,
+) -> None:
+    """Crop, resize, and preserve useful source metadata when supported."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source_path) as source:
@@ -400,6 +456,9 @@ def save_cropped_image(source_path: Path, output_path: Path, crop_box: CropBox) 
         oriented = ImageOps.exif_transpose(source)
         box = crop_box.clamp(*oriented.size)
         cropped = oriented.crop(box.as_tuple())
+        output_size = output_size_for_crop(box, scale_percent)
+        if output_size != cropped.size:
+            cropped = resize_image_high_quality(cropped, output_size)
 
         save_options: dict[str, object] = {}
         if source.info.get("icc_profile"):
@@ -551,16 +610,19 @@ def save_cropped_gif_atomic(
     output_path: Path,
     crop_box: CropBox,
     *,
+    scale_percent: int = 100,
     progress_callback: Callable[[int, int], None] | None = None,
     validating_callback: Callable[[], None] | None = None,
 ) -> None:
-    """Crop, encode, validate, and atomically replace one animated GIF."""
+    """Crop, resize, encode, validate, and atomically replace one animated GIF."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     box = crop_box.clamp(*animation.size)
+    output_size = output_size_for_crop(box, scale_percent)
     cropped_frames: list[Image.Image] = []
     for frame in animation.frames:
-        cropped_frames.append(frame.crop(box.as_tuple()))
+        cropped = frame.crop(box.as_tuple())
+        cropped_frames.append(resize_image_high_quality(cropped, output_size))
 
     temporary_file = tempfile.NamedTemporaryFile(
         prefix=f".{output_path.stem}-",
@@ -579,7 +641,7 @@ def save_cropped_gif_atomic(
         )
         if validating_callback is not None:
             validating_callback()
-        validate_cropped_gif(temporary_path, animation, (box.width, box.height))
+        validate_cropped_gif(temporary_path, animation, output_size)
         os.replace(temporary_path, output_path)
     finally:
         if temporary_path.exists():
