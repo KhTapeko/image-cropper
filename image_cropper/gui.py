@@ -8,38 +8,33 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
-from .config import (
-    CLOSEUP_MASK_MEAN_MIN,
-    COMPONENT_JOIN_DISTANCE_RATIO,
-    DARK_MASK_MEAN_MAX,
-    DETECTION_PADDING_RATIO,
-    MASK_HIGH_THRESHOLD,
-    MASK_LOW_THRESHOLD,
-    MASK_THRESHOLD,
-    MIN_COMPONENT_AREA_RATIO,
-    MIN_COMPONENT_RELATIVE_AREA,
-    MIN_FOREGROUND_AREA_RATIO,
-    OUTSIDE_SHADE_ALPHA,
-    SMALL_BORDER_COMPONENT_MAX_AREA_RATIO,
-)
+from .config import OUTSIDE_SHADE_ALPHA
 from .core import (
     MAX_SCALE_PERCENT,
     MIN_SCALE_PERCENT,
     CropBox,
     GifAnimation,
-    composite_transparency_for_detection,
     estimate_output_bytes,
-    gif_sample_indices,
     load_gif_animation,
+    load_gif_preview_frame,
     load_oriented_image,
-    mask_to_suggested_crop,
     output_size_for_crop,
-    resolve_gif_crop,
     save_cropped_gif_atomic,
     save_cropped_image,
     scan_input_images,
 )
 from .detector import AnimePersonDetector
+from .prefetch import (
+    DetectionCompleted,
+    DetectionPrefetcher,
+    DetectionResult,
+    DetectorInitialized,
+    DetectorInitializingPortrait,
+    FileFingerprint,
+    GifDetectionProgress,
+    PortraitAvailabilityChanged,
+    PrimaryCudaUnavailable,
+)
 
 
 def shade_outside_crop(
@@ -79,7 +74,6 @@ class ImageCropperApp:
         root: tk.Tk,
         project_root: Path,
         *,
-        preferred_device: str = "cpu",
         detector: AnimePersonDetector | None = None,
         auto_initialize_detector: bool = True,
     ) -> None:
@@ -96,12 +90,17 @@ class ImageCropperApp:
         self.failures: list[tuple[str, str]] = []
         self.completed = False
 
-        self.detector = detector or AnimePersonDetector(preferred_device)
-        self.preferred_device = preferred_device
+        self.detector = detector or AnimePersonDetector()
         self._detector_ready = not auto_initialize_detector
-        self._pending_detection: tuple[str, int, object] | None = None
-        self._rebuilding_cuda = False
-        self._worker_events: Queue[tuple[object, ...]] = Queue()
+        self._worker_events: Queue[object] = Queue()
+        self._prefetch_results: dict[Path, DetectionResult] = {}
+        self._primary_cuda_error: str | None = None
+        self._gif_preview_loading_generation: int | None = None
+        self._prefetcher = (
+            DetectionPrefetcher(self.detector, self.paths, self._worker_events.put)
+            if auto_initialize_detector
+            else None
+        )
         self.current_path: Path | None = None
         self.current_image: Image.Image | None = None
         self.current_animation: GifAnimation | None = None
@@ -125,13 +124,11 @@ class ImageCropperApp:
         self.root.after(50, self._load_next)
         if auto_initialize_detector:
             self.device_label.configure(
-                text=(
-                    "辨識裝置：正在準備 NVIDIA GPU…"
-                    if preferred_device == "cuda"
-                    else "辨識裝置：正在準備 CPU…"
-                )
+                text="辨識裝置：正在準備本機 GPU（CUDA）…"
             )
-            threading.Thread(target=self._initialize_detector, daemon=True).start()
+            self.status_label.configure(text="正在準備主要人物辨識模型…")
+            assert self._prefetcher is not None
+            self._prefetcher.start()
         else:
             self.device_label.configure(text="辨識裝置：測試模式")
 
@@ -254,53 +251,41 @@ class ImageCropperApp:
         if not self._saving and not self.completed:
             self.confirm_button.configure(state="normal")
 
-    def _initialize_detector(self) -> None:
-        try:
-            fallback_reason = self.detector.initialize()
-            error = None
-        except Exception as exc:
-            fallback_reason = None
-            error = str(exc)
-        self._worker_events.put(
-            ("detector_initialized", fallback_reason, error)
-        )
-
     def _finish_detector_initialization(
         self,
-        fallback_reason: str | None,
+        portrait_error: str | None,
         error: str | None,
     ) -> None:
         if error is not None:
-            self._stop_batch_for_device_error(f"辨識裝置初始化失敗：{error}")
+            self.completed = True
+            self.device_label.configure(text="辨識裝置：GPU 無法使用")
+            messagebox.showerror(
+                "GPU 無法使用",
+                f"GPU 無法使用，程式無法啟動人物辨識\n\n{error}",
+            )
+            self.root.destroy()
             return
 
         self._detector_ready = True
-        self.device_label.configure(text=f"辨識裝置：{self.detector.device_label}")
-        if fallback_reason is not None:
-            warning = f"GPU 無法使用，已改用 CPU：{fallback_reason}"
+        self._update_device_label()
+        if portrait_error is not None:
+            warning = "二次人物辨識無法使用；仍可使用第一次辨識與手動裁切"
             self.status_label.configure(text=warning)
-            messagebox.showwarning("GPU 無法使用", warning)
-        self._start_pending_detection()
+            messagebox.showwarning(
+                "二次人物辨識無法使用",
+                f"{warning}\n\n{portrait_error}",
+            )
+        if self._prefetcher is not None:
+            self._consume_current_prefetch_result(self._generation)
 
-    def _start_pending_detection(self) -> None:
-        pending = self._pending_detection
-        if not self._detector_ready or pending is None:
-            return
-        self._pending_detection = None
-        kind, generation, payload = pending
-        if generation != self._generation:
-            return
-        if kind == "gif":
-            assert isinstance(payload, Path)
-            self._start_gif_detection(generation, payload)
-        else:
-            assert isinstance(payload, Image.Image)
-            self._start_static_detection(generation, payload)
+    def _update_device_label(self) -> None:
+        portrait_status = "可用" if self.detector.portrait_available else "不可用"
+        self.device_label.configure(
+            text=f"辨識裝置：本機 GPU（CUDA）｜二次辨識：{portrait_status}"
+        )
 
     def _waiting_for_detector_text(self) -> str:
-        if self.preferred_device == "cuda":
-            return "正在準備 NVIDIA GPU…"
-        return "正在準備 CPU 人物辨識器…"
+        return "正在準備本機 GPU 與人物辨識模型…"
 
     def _load_next(self) -> None:
         self._cancel_animation_preview()
@@ -317,7 +302,7 @@ class ImageCropperApp:
         self.current_animation = None
         self.current_frame_index = 0
         self.crop_box = None
-        self._pending_detection = None
+        self._gif_preview_loading_generation = None
         self._interaction_ready = False
         self._saving = False
         self.scale_percent_var.set("100")
@@ -328,11 +313,22 @@ class ImageCropperApp:
         self.canvas.delete("all")
 
         if self.current_path.suffix.casefold() == ".gif":
-            if not self._detector_ready:
-                self.status_label.configure(text=self._waiting_for_detector_text())
-                self._pending_detection = ("gif", generation, self.current_path)
-            else:
-                self._start_gif_detection(generation, self.current_path)
+            if self._prefetcher is not None:
+                try:
+                    self.current_image = load_gif_preview_frame(self.current_path)
+                except Exception as exc:
+                    self._discard_current_result()
+                    self._record_current_failure("GIF 讀取失敗", str(exc))
+                    return
+                width, height = self.current_image.size
+                self.file_label.configure(
+                    text=f"{self.current_path.name}　{width} × {height}"
+                )
+                self.crop_box = CropBox(0, 0, width, height)
+                self._render_current()
+                self._consume_current_prefetch_result(generation)
+                return
+            self.status_label.configure(text="測試模式：尚未提供預先辨識結果")
             return
 
         self.status_label.configure(text="正在讀取圖片…")
@@ -340,6 +336,7 @@ class ImageCropperApp:
         try:
             self.current_image = load_oriented_image(self.current_path)
         except Exception as exc:
+            self._discard_current_result()
             self.failures.append((self.current_path.name, f"讀取失敗：{exc}"))
             messagebox.showerror("圖片讀取失敗", f"無法讀取 {self.current_path.name}\n\n{exc}")
             self.index += 1
@@ -351,169 +348,225 @@ class ImageCropperApp:
         self.crop_box = CropBox(0, 0, width, height)
         self._render_current()
 
-        image_for_detection = self.current_image.copy()
-        if not self._detector_ready:
-            self.status_label.configure(text=self._waiting_for_detector_text())
-            self._pending_detection = ("static", generation, image_for_detection)
+        if self._prefetcher is not None:
+            self._consume_current_prefetch_result(generation)
             return
-        self._start_static_detection(generation, image_for_detection)
 
-    def _start_static_detection(self, generation: int, image: Image.Image) -> None:
-        self.status_label.configure(text="正在辨識人物…")
-        worker = threading.Thread(
-            target=self._detect_in_background,
-            args=(generation, image),
-            daemon=True,
-        )
-        worker.start()
+        self.status_label.configure(text="測試模式：尚未提供預先辨識結果")
 
-    def _start_gif_detection(self, generation: int, path: Path) -> None:
-        self.status_label.configure(text="正在讀取 GIF…")
-        worker = threading.Thread(
-            target=self._load_and_detect_gif,
-            args=(generation, path),
-            daemon=True,
-        )
-        worker.start()
-
-    def _detect_in_background(self, generation: int, image: Image.Image) -> None:
-        was_cuda = self.detector.uses_cuda
-        try:
-            mask = self.detector.create_mask(image)
-            suggestion = self._suggest_crop(mask, image.size, DETECTION_PADDING_RATIO)
-            error = None
-            gpu_runtime_failure = False
-        except Exception as exc:
-            suggestion = None
-            error = str(exc)
-            gpu_runtime_failure = was_cuda
-        self._worker_events.put(
-            (
-                "static_detection",
-                generation,
-                suggestion,
-                error,
-                gpu_runtime_failure,
-            )
-        )
-
-    @staticmethod
-    def _suggest_crop(
-        mask: Image.Image,
-        image_size: tuple[int, int],
-        padding_ratio: float,
-    ) -> CropBox | None:
-        return mask_to_suggested_crop(
-            mask,
-            image_size,
-            threshold=MASK_THRESHOLD,
-            low_threshold=MASK_LOW_THRESHOLD,
-            high_threshold=MASK_HIGH_THRESHOLD,
-            dark_mask_mean_max=DARK_MASK_MEAN_MAX,
-            closeup_mask_mean_min=CLOSEUP_MASK_MEAN_MIN,
-            min_foreground_area_ratio=MIN_FOREGROUND_AREA_RATIO,
-            min_component_area_ratio=MIN_COMPONENT_AREA_RATIO,
-            min_component_relative_area=MIN_COMPONENT_RELATIVE_AREA,
-            component_join_distance_ratio=COMPONENT_JOIN_DISTANCE_RATIO,
-            small_border_component_max_area_ratio=SMALL_BORDER_COMPONENT_MAX_AREA_RATIO,
-            padding_ratio=padding_ratio,
-        )
-
-    def _load_and_detect_gif(self, generation: int, path: Path) -> None:
-        try:
-            animation = load_gif_animation(path)
-            sample_indices = gif_sample_indices(animation.frame_count)
-            suggestions: list[CropBox] = []
-            error_count = 0
-            for completed, frame_index in enumerate(sample_indices, start=1):
-                was_cuda = self.detector.uses_cuda
-                try:
-                    detection_image = composite_transparency_for_detection(
-                        animation.frames[frame_index]
-                    )
-                    mask = self.detector.create_mask(detection_image)
-                    suggestion = self._suggest_crop(mask, animation.size, 0.0)
-                except Exception as exc:
-                    if was_cuda:
-                        self._worker_events.put(
-                            (
-                                "gif_detection_complete",
-                                generation,
-                                None,
-                                None,
-                                0,
-                                len(sample_indices),
-                                0,
-                                str(exc),
-                                True,
-                            )
-                        )
-                        return
-                    suggestion = None
-                    error_count += 1
-                if suggestion is not None:
-                    suggestions.append(suggestion)
-                self._worker_events.put(
-                    ("gif_detection_progress", generation, completed, len(sample_indices))
+    def _consume_current_prefetch_result(self, generation: int) -> None:
+        if generation != self._generation or self.current_path is None:
+            return
+        result = self._prefetch_results.get(self.current_path)
+        if result is None:
+            if self._primary_cuda_error is not None:
+                self._stop_batch_for_device_error(
+                    f"CUDA 重建失敗：{self._primary_cuda_error}"
                 )
+            elif not self._detector_ready:
+                self.status_label.configure(text=self._waiting_for_detector_text())
+            else:
+                self.status_label.configure(text="背景辨識尚未完成，請稍候…")
+            return
 
-            crop_box = resolve_gif_crop(
-                suggestions,
-                animation.size,
-                error_count=error_count,
-                padding_ratio=DETECTION_PADDING_RATIO,
+        try:
+            current_fingerprint = FileFingerprint.capture(self.current_path)
+        except Exception as exc:
+            self._discard_current_result()
+            self._record_current_failure("圖片讀取失敗", str(exc))
+            return
+
+        if result.fingerprint != current_fingerprint:
+            self._discard_current_result()
+            assert self._prefetcher is not None
+            self._prefetcher.reprioritize(self.current_path)
+            self.status_label.configure(text="來源檔案已變更，正在重新辨識…")
+            return
+
+        if result.outcome == "read_error":
+            self._discard_current_result()
+            self._record_current_failure(
+                "圖片讀取失敗",
+                result.error or "無法讀取來源檔案",
             )
+            return
+        if result.outcome in {"primary_error", "gif_error"}:
+            self._discard_current_result()
+            self._record_current_failure(
+                "GPU 辨識失敗" if result.outcome == "primary_error" else "GIF 處理失敗",
+                result.error or "人物辨識失敗",
+            )
+            return
 
+        if result.kind == "gif":
+            self._start_gif_preview_load(generation, result)
+        else:
+            self._apply_static_prefetch_result(result)
+
+    def _apply_static_prefetch_result(self, result: DetectionResult) -> None:
+        if self.current_image is None:
+            return
+        if result.crop_box is None:
+            width, height = self.current_image.size
+            self.crop_box = CropBox(0, 0, width, height)
+            if result.outcome in {"secondary_unavailable", "secondary_error"}:
+                self.status_label.configure(
+                    text="二次人物辨識無法使用，請手動調整裁切框"
+                )
+            else:
+                self.status_label.configure(
+                    text="二次辨識仍不可靠，請手動調整裁切框"
+                )
+        else:
+            self.crop_box = result.crop_box
+            self.status_label.configure(
+                text="請調整裁切框與輸出倍率，確認後立即儲存"
+            )
+        self._interaction_ready = True
+        self._set_scale_control_enabled(True)
+        self._render_current()
+
+    def _start_gif_preview_load(
+        self,
+        generation: int,
+        result: DetectionResult,
+    ) -> None:
+        if self._gif_preview_loading_generation == generation:
+            return
+        assert self.current_path is not None
+        path = self.current_path
+        self._gif_preview_loading_generation = generation
+        self.status_label.configure(text="正在準備 GIF 動畫預覽…")
+
+        def load_worker() -> None:
+            try:
+                animation = load_gif_animation(path)
+                fingerprint = FileFingerprint.capture(path)
+                error = None
+            except Exception as exc:
+                animation = None
+                fingerprint = None
+                error = str(exc)
             self._worker_events.put(
                 (
-                    "gif_detection_complete",
+                    "gif_preview_loaded",
                     generation,
+                    path,
+                    result,
                     animation,
-                    crop_box,
-                    len(sample_indices) - error_count,
-                    len(sample_indices),
-                    error_count,
-                    None,
-                    False,
+                    fingerprint,
+                    error,
                 )
             )
-        except Exception as exc:
-            self._worker_events.put(
-                (
-                    "gif_detection_complete",
-                    generation,
-                    None,
-                    None,
-                    0,
-                    0,
-                    0,
-                    str(exc),
-                    False,
+
+        threading.Thread(target=load_worker, daemon=True).start()
+
+    def _finish_gif_preview_load(
+        self,
+        generation: int,
+        path: Path,
+        result: DetectionResult,
+        animation: GifAnimation | None,
+        fingerprint: FileFingerprint | None,
+        error: str | None,
+    ) -> None:
+        if generation != self._generation or path != self.current_path:
+            return
+        self._gif_preview_loading_generation = None
+        if error is not None or animation is None or fingerprint is None:
+            self._discard_current_result()
+            self._record_current_failure(
+                "GIF 讀取失敗",
+                error or "無法載入 GIF 動畫預覽",
+            )
+            return
+        if fingerprint != result.fingerprint:
+            self._discard_current_result()
+            assert self._prefetcher is not None
+            self._prefetcher.reprioritize(path)
+            self.status_label.configure(text="來源 GIF 已變更，正在重新辨識…")
+            return
+
+        self.current_animation = animation
+        self.current_frame_index = 0
+        self.current_image = animation.frames[0]
+        self.crop_box = result.crop_box or CropBox(0, 0, *animation.size)
+        if result.error_count:
+            self.status_label.configure(
+                text=(
+                    f"已使用 {result.successful_samples} / {result.total_samples} 個取樣影格；"
+                    f"{result.error_count} 格辨識失敗，請確認裁切範圍"
                 )
             )
+        else:
+            self.status_label.configure(
+                text="請調整共用裁切框與輸出倍率，確認後立即儲存"
+            )
+        self._interaction_ready = True
+        self._set_scale_control_enabled(True)
+        self._render_current()
+        self._schedule_next_animation_frame()
+
+    def _record_current_failure(self, title: str, reason: str) -> None:
+        if self.current_path is None:
+            return
+        name = self.current_path.name
+        self.failures.append((name, f"{title}：{reason}"))
+        messagebox.showerror(title, f"無法處理 {name}\n\n{reason}")
+        self.index += 1
+        self.root.after(1, self._load_next)
+
+    def _discard_current_result(self) -> None:
+        if self.current_path is not None:
+            self._prefetch_results.pop(self.current_path, None)
 
     def _poll_worker_events(self) -> None:
         try:
             while True:
                 event = self._worker_events.get_nowait()
-                event_type = event[0]
-                if event_type == "detector_initialized":
-                    _kind, fallback_reason, error = event
-                    self._finish_detector_initialization(fallback_reason, error)
-                elif event_type == "static_detection":
-                    _kind, generation, suggestion, error, gpu_runtime_failure = event
-                    self._finish_detection(
-                        generation,
-                        suggestion,
-                        error,
-                        gpu_runtime_failure,
+                if isinstance(event, DetectorInitializingPortrait):
+                    self.status_label.configure(
+                        text="正在準備精細人物模型，首次使用需要下載約 1 GB…"
                     )
-                elif event_type == "gif_detection_progress":
-                    _kind, generation, completed, total = event
-                    self._show_gif_detection_progress(generation, completed, total)
-                elif event_type == "gif_detection_complete":
-                    self._finish_gif_detection(*event[1:])
-                elif event_type == "gif_save_progress":
+                    continue
+                if isinstance(event, DetectorInitialized):
+                    self._finish_detector_initialization(
+                        event.portrait_error,
+                        event.error,
+                    )
+                    continue
+                if isinstance(event, DetectionCompleted):
+                    self._prefetch_results[event.result.path] = event.result
+                    if event.result.path == self.current_path:
+                        self._consume_current_prefetch_result(self._generation)
+                    continue
+                if isinstance(event, GifDetectionProgress):
+                    if event.path == self.current_path:
+                        self.status_label.configure(
+                            text=(
+                                f"正在辨識 GIF：{event.completed} / "
+                                f"{event.total} 個取樣影格"
+                            )
+                        )
+                    continue
+                if isinstance(event, PortraitAvailabilityChanged):
+                    self._update_device_label()
+                    continue
+                if isinstance(event, PrimaryCudaUnavailable):
+                    self._primary_cuda_error = event.error
+                    self.device_label.configure(text="辨識裝置：CUDA 無法重建")
+                    if (
+                        self.current_path is not None
+                        and self.current_path not in self._prefetch_results
+                    ):
+                        self._stop_batch_for_device_error(
+                            f"CUDA 重建失敗：{event.error}"
+                        )
+                    continue
+
+                assert isinstance(event, tuple)
+                event_type = event[0]
+                if event_type == "gif_save_progress":
                     _kind, generation, completed, total = event
                     if generation == self._generation:
                         self.status_label.configure(
@@ -526,145 +579,22 @@ class ImageCropperApp:
                 elif event_type == "gif_save_complete":
                     _kind, generation, error = event
                     self._finish_gif_save(generation, error)
-                elif event_type == "cuda_rebuild_complete":
-                    _kind, generation, error = event
-                    self._finish_cuda_rebuild(generation, error)
+                elif event_type == "gif_preview_loaded":
+                    self._finish_gif_preview_load(*event[1:])
         except Empty:
             pass
-        if self.root.winfo_exists():
+        try:
+            root_exists = self.root.winfo_exists()
+        except tk.TclError:
+            return
+        if root_exists:
             self.root.after(50, self._poll_worker_events)
-
-    def _finish_detection(
-        self,
-        generation: int,
-        suggestion: CropBox | None,
-        error: str | None,
-        gpu_runtime_failure: bool = False,
-    ) -> None:
-        if generation != self._generation or self.current_image is None:
-            return
-        if gpu_runtime_failure:
-            self._handle_gpu_runtime_failure(error or "未知 CUDA 錯誤")
-            return
-        if suggestion is None:
-            width, height = self.current_image.size
-            self.crop_box = CropBox(0, 0, width, height)
-            if error:
-                self.status_label.configure(text=f"人物辨識失敗，請手動調整裁切框：{error}")
-            else:
-                self.status_label.configure(text="未能可靠辨識人物，請手動調整裁切框")
-        else:
-            self.crop_box = suggestion
-            self.status_label.configure(text="請調整裁切框與輸出倍率，確認後立即儲存")
-        self._interaction_ready = True
-        self._set_scale_control_enabled(True)
-        self._render_current()
-
-    def _show_gif_detection_progress(
-        self,
-        generation: int,
-        completed: int,
-        total: int,
-    ) -> None:
-        if generation != self._generation:
-            return
-        self.status_label.configure(
-            text=f"正在辨識 GIF：{completed} / {total} 個取樣影格"
-        )
-
-    def _finish_gif_detection(
-        self,
-        generation: int,
-        animation: GifAnimation | None,
-        crop_box: CropBox | None,
-        successful_samples: int,
-        total_samples: int,
-        error_count: int,
-        error: str | None,
-        gpu_runtime_failure: bool = False,
-    ) -> None:
-        if generation != self._generation:
-            return
-        if gpu_runtime_failure:
-            self._handle_gpu_runtime_failure(error or "未知 CUDA 錯誤")
-            return
-        if error is not None or animation is None or crop_box is None:
-            assert self.current_path is not None
-            reason = error or "GIF 處理失敗"
-            self.failures.append((self.current_path.name, reason))
-            messagebox.showerror(
-                "GIF 處理失敗",
-                f"無法處理 {self.current_path.name}\n\n{reason}",
-            )
-            self.index += 1
-            self.root.after(1, self._load_next)
-            return
-
-        self.current_animation = animation
-        self.current_frame_index = 0
-        self.current_image = animation.frames[0]
-        self.crop_box = crop_box
-        width, height = animation.size
-        assert self.current_path is not None
-        self.file_label.configure(text=f"{self.current_path.name}　{width} × {height}")
-        if error_count:
-            self.status_label.configure(
-                text=(
-                    f"已使用 {successful_samples} / {total_samples} 個取樣影格；"
-                    f"{error_count} 格辨識失敗，請確認裁切範圍"
-                )
-            )
-        else:
-            self.status_label.configure(
-                text="請調整共用裁切框與輸出倍率，確認後立即儲存"
-            )
-        self._interaction_ready = True
-        self._set_scale_control_enabled(True)
-        self._render_current()
-        self._schedule_next_animation_frame()
-
-    def _handle_gpu_runtime_failure(self, reason: str) -> None:
-        if self._rebuilding_cuda or self.current_path is None:
-            return
-        self._cancel_animation_preview()
-        self._interaction_ready = False
-        self._set_scale_control_enabled(False)
-        self.confirm_button.configure(state="disabled")
-        self.failures.append((self.current_path.name, f"GPU 辨識失敗：{reason}"))
-        messagebox.showerror(
-            "GPU 辨識失敗",
-            f"{self.current_path.name} 已列為未處理圖片。\n\n{reason}",
-        )
-        self._rebuilding_cuda = True
-        self.status_label.configure(text="GPU 辨識失敗，正在重建 CUDA…")
-        generation = self._generation
-
-        def rebuild_worker() -> None:
-            try:
-                self.detector.rebuild_cuda()
-                error = None
-            except Exception as exc:
-                error = str(exc)
-            self._worker_events.put(("cuda_rebuild_complete", generation, error))
-
-        threading.Thread(target=rebuild_worker, daemon=True).start()
-
-    def _finish_cuda_rebuild(self, generation: int, error: str | None) -> None:
-        if generation != self._generation:
-            return
-        self._rebuilding_cuda = False
-        if error is not None:
-            self.device_label.configure(text="辨識裝置：CUDA 無法重建")
-            self._stop_batch_for_device_error(f"CUDA 重建失敗：{error}")
-            return
-        self.device_label.configure(text=f"辨識裝置：{self.detector.device_label}")
-        self.index += 1
-        self.root.after(1, self._load_next)
 
     def _stop_batch_for_device_error(self, reason: str) -> None:
         self._cancel_animation_preview()
+        if self._prefetcher is not None:
+            self._prefetcher.stop()
         self.completed = True
-        self._pending_detection = None
         self._interaction_ready = False
         self._set_scale_control_enabled(False)
         self.current_path = None
@@ -901,6 +831,7 @@ class ImageCropperApp:
         else:
             self.success_count += 1
         self._saving = False
+        self._discard_current_result()
         self.index += 1
         self.root.after(1, self._load_next)
 
@@ -956,11 +887,14 @@ class ImageCropperApp:
             self._schedule_next_animation_frame()
             return
         self.success_count += 1
+        self._discard_current_result()
         self.index += 1
         self.root.after(1, self._load_next)
 
     def _show_completion(self) -> None:
         self._cancel_animation_preview()
+        if self._prefetcher is not None:
+            self._prefetcher.stop()
         self.completed = True
         self.current_path = None
         self.current_image = None
@@ -986,17 +920,21 @@ class ImageCropperApp:
             return
         if self.completed or self.current_path is None:
             self._cancel_animation_preview()
+            if self._prefetcher is not None:
+                self._prefetcher.stop()
             self.root.destroy()
             return
         if messagebox.askyesno("確認離開", "目前圖片尚未儲存，確定要離開嗎？"):
             self._cancel_animation_preview()
+            if self._prefetcher is not None:
+                self._prefetcher.stop()
             self.root.destroy()
 
 
-def run_app(project_root: Path, *, preferred_device: str = "cpu") -> None:
+def run_app(project_root: Path) -> None:
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
-    ImageCropperApp(root, project_root, preferred_device=preferred_device)
+    ImageCropperApp(root, project_root)
     root.mainloop()

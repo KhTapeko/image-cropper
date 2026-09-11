@@ -81,6 +81,38 @@ class CropBox:
         return CropBox(left, top, right, bottom).clamp(image_width, image_height, min_size)
 
 
+def add_crop_padding(
+    crop_box: CropBox,
+    image_size: tuple[int, int],
+    padding_ratio: float,
+) -> CropBox:
+    """Add proportional padding to a crop and clamp it to the image."""
+
+    image_width, image_height = image_size
+    padding_ratio = max(0.0, padding_ratio)
+    pad_x = math.ceil(crop_box.width * padding_ratio)
+    pad_y = math.ceil(crop_box.height * padding_ratio)
+    return CropBox(
+        max(0, crop_box.left - pad_x),
+        max(0, crop_box.top - pad_y),
+        min(image_width, crop_box.right + pad_x),
+        min(image_height, crop_box.bottom + pad_y),
+    ).clamp(image_width, image_height)
+
+
+def is_unreliable_suggested_crop(
+    crop_box: CropBox | None,
+    image_size: tuple[int, int],
+    maximum_area_ratio: float = 0.95,
+) -> bool:
+    """Return whether an unpadded suggestion is absent or covers too much."""
+
+    if crop_box is None:
+        return True
+    image_area = max(1, image_size[0] * image_size[1])
+    return crop_box.width * crop_box.height >= image_area * maximum_area_ratio
+
+
 @dataclass(frozen=True)
 class GifAnimation:
     """A fully decoded GIF plus the playback metadata needed for re-encoding."""
@@ -279,13 +311,10 @@ def mask_to_suggested_crop(
     top = min(group[2] for group in kept_groups)
     right = max(group[3] for group in kept_groups)
     bottom = max(group[4] for group in kept_groups)
-    pad_x = math.ceil((right - left) * padding_ratio)
-    pad_y = math.ceil((bottom - top) * padding_ratio)
-    return CropBox(
-        max(0, left - pad_x),
-        max(0, top - pad_y),
-        min(image_width, right + pad_x),
-        min(image_height, bottom + pad_y),
+    return add_crop_padding(
+        CropBox(left, top, right, bottom),
+        image_size,
+        padding_ratio,
     )
 
 
@@ -363,7 +392,7 @@ def composite_transparency_for_detection(
     return Image.alpha_composite(backdrop, foreground).convert("RGB")
 
 
-def sort_paths_by_creation_desc(
+def sort_paths_by_creation_asc(
     paths: Iterable[Path],
     creation_time_getter: Callable[[Path], int] | None = None,
 ) -> list[Path]:
@@ -372,7 +401,7 @@ def sort_paths_by_creation_desc(
         paths,
         key=lambda path: (
             path.suffix.casefold() == ".gif",
-            -getter(path),
+            getter(path),
             path.name.casefold(),
         ),
     )
@@ -386,7 +415,7 @@ def scan_input_images(input_directory: Path) -> list[Path]:
         for path in input_directory.iterdir()
         if path.is_file() and path.suffix.casefold() in SUPPORTED_EXTENSIONS
     )
-    return sort_paths_by_creation_desc(candidates)
+    return sort_paths_by_creation_asc(candidates)
 
 
 def load_oriented_image(path: Path) -> Image.Image:
@@ -435,6 +464,17 @@ def load_gif_animation(path: Path) -> GifAnimation:
         comment=global_info.get("comment"),
         background_color=background_color,
     )
+
+
+def load_gif_preview_frame(path: Path) -> Image.Image:
+    """Load only the first composited GIF frame for a responsive waiting view."""
+
+    with Image.open(path) as source:
+        if (source.format or "").upper() != "GIF":
+            raise ValueError("檔案不是 GIF")
+        source.seek(0)
+        source.load()
+        return source.convert("RGBA").copy()
 
 
 def save_cropped_image(

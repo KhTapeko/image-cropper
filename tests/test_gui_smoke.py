@@ -4,12 +4,13 @@ from pathlib import Path
 import tempfile
 import tkinter as tk
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
 from image_cropper.core import CropBox, GifAnimation
 from image_cropper.gui import ImageCropperApp, format_file_size, shade_outside_crop
+from image_cropper.prefetch import DetectionResult, FileFingerprint
 
 
 class OutsideShadeTests(unittest.TestCase):
@@ -41,6 +42,94 @@ class FileSizeFormattingTests(unittest.TestCase):
 
 
 class GuiSmokeTests(unittest.TestCase):
+    def test_cached_static_result_enables_interaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            Image.new("RGB", (100, 60)).save(source)
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = source
+                app.current_image = Image.new("RGB", (100, 60))
+                result = DetectionResult(
+                    path=source,
+                    fingerprint=FileFingerprint.capture(source),
+                    kind="static",
+                    image_size=(100, 60),
+                    crop_box=CropBox(20, 5, 80, 55),
+                    model_name="isnet-anime",
+                    reliable=True,
+                    outcome="primary",
+                )
+                app._apply_static_prefetch_result(result)
+
+                self.assertEqual(app.crop_box, CropBox(20, 5, 80, 55))
+                self.assertTrue(app._interaction_ready)
+                self.assertEqual(str(app.confirm_button.cget("state")), "normal")
+            finally:
+                root.destroy()
+
+    def test_unreliable_cached_result_falls_back_to_manual_full_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                app.current_path = Path(directory) / "sample.png"
+                app.current_image = Image.new("RGB", (100, 60))
+                result = DetectionResult(
+                    path=app.current_path,
+                    fingerprint=None,
+                    kind="static",
+                    image_size=(100, 60),
+                    crop_box=None,
+                    model_name="birefnet-portrait",
+                    reliable=False,
+                    outcome="secondary_unreliable",
+                )
+                app._apply_static_prefetch_result(result)
+
+                self.assertEqual(app.crop_box, CropBox(0, 0, 100, 60))
+                self.assertTrue(app._interaction_ready)
+                self.assertIn("仍不可靠", app.status_label.cget("text"))
+            finally:
+                root.destroy()
+
+    def test_changed_source_discards_result_and_prioritizes_redetection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.png"
+            Image.new("RGB", (20, 10), "white").save(source)
+            old_fingerprint = FileFingerprint.capture(source)
+            source.write_bytes(source.read_bytes() + b"changed")
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
+                prefetcher = Mock()
+                app._prefetcher = prefetcher
+                app.current_path = source
+                app.current_image = Image.new("RGB", (20, 10))
+                app._prefetch_results[source] = DetectionResult(
+                    path=source,
+                    fingerprint=old_fingerprint,
+                    kind="static",
+                    image_size=(20, 10),
+                    crop_box=CropBox(1, 1, 19, 9),
+                    model_name="isnet-anime",
+                    reliable=True,
+                    outcome="primary",
+                )
+
+                app._consume_current_prefetch_result(app._generation)
+
+                self.assertNotIn(source, app._prefetch_results)
+                prefetcher.reprioritize.assert_called_once_with(source)
+                self.assertFalse(app._interaction_ready)
+                self.assertIn("重新辨識", app.status_label.cget("text"))
+            finally:
+                root.destroy()
+
     def test_loading_each_image_resets_scale_to_one_hundred_percent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "sample.png"
@@ -51,8 +140,7 @@ class GuiSmokeTests(unittest.TestCase):
                 app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
                 app.paths = [source]
                 app.scale_percent_var.set("180")
-                with patch.object(app, "_start_static_detection"):
-                    app._load_next()
+                app._load_next()
                 self.assertEqual(app.scale_percent_var.get(), "100")
                 self.assertEqual(str(app.scale_spinbox.cget("state")), "disabled")
             finally:
@@ -205,11 +293,13 @@ class GuiSmokeTests(unittest.TestCase):
 
     def test_finished_gif_detection_starts_looping_preview_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sample.gif"
+            Image.new("RGBA", (20, 10), "red").save(source, format="GIF")
             root = tk.Tk()
             root.withdraw()
             try:
                 app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
-                app.current_path = Path(directory) / "sample.gif"
+                app.current_path = source
                 frames = (
                     Image.new("RGBA", (20, 10), "red"),
                     Image.new("RGBA", (20, 10), "blue"),
@@ -230,13 +320,25 @@ class GuiSmokeTests(unittest.TestCase):
                     return original_after(delay, callback, *args)
 
                 root.after = capture_after  # type: ignore[method-assign]
-                app._finish_gif_detection(
+                result = DetectionResult(
+                    path=source,
+                    fingerprint=FileFingerprint.capture(source),
+                    kind="gif",
+                    image_size=(20, 10),
+                    crop_box=CropBox(1, 1, 19, 9),
+                    model_name="isnet-anime",
+                    reliable=True,
+                    outcome="gif",
+                    successful_samples=2,
+                    total_samples=3,
+                    error_count=1,
+                )
+                app._finish_gif_preview_load(
                     app._generation,
+                    source,
+                    result,
                     animation,
-                    CropBox(1, 1, 19, 9),
-                    2,
-                    3,
-                    1,
+                    FileFingerprint.capture(source),
                     None,
                 )
                 self.assertIs(app.current_animation, animation)
@@ -248,28 +350,6 @@ class GuiSmokeTests(unittest.TestCase):
             finally:
                 root.destroy()
 
-    def test_gpu_runtime_error_marks_current_image_and_rebuilds_without_cpu_retry(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = tk.Tk()
-            root.withdraw()
-            try:
-                app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
-                app.current_path = Path(directory) / "sample.png"
-                app.current_image = Image.new("RGB", (20, 10))
-                app.crop_box = CropBox(0, 0, 20, 10)
-                with (
-                    patch.object(app.detector, "rebuild_cuda", return_value=None) as rebuild,
-                    patch("image_cropper.gui.messagebox.showerror"),
-                ):
-                    app._handle_gpu_runtime_failure("CUDA out of memory")
-                    event = app._worker_events.get(timeout=2)
-                self.assertEqual(len(app.failures), 1)
-                self.assertIn("GPU 辨識失敗", app.failures[0][1])
-                rebuild.assert_called_once_with()
-                self.assertEqual(event[0], "cuda_rebuild_complete")
-            finally:
-                root.destroy()
-
     def test_failed_cuda_rebuild_stops_batch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = tk.Tk()
@@ -277,7 +357,9 @@ class GuiSmokeTests(unittest.TestCase):
             try:
                 app = ImageCropperApp(root, Path(directory), auto_initialize_detector=False)
                 with patch("image_cropper.gui.messagebox.showerror"):
-                    app._finish_cuda_rebuild(app._generation, "driver reset failed")
+                    app._stop_batch_for_device_error(
+                        "CUDA 重建失敗：driver reset failed"
+                    )
                 self.assertTrue(app.completed)
                 self.assertIn("批次已停止", app.file_label.cget("text"))
                 self.assertIn("CUDA 重建失敗", app.status_label.cget("text"))

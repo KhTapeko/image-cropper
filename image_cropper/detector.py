@@ -2,21 +2,19 @@ from __future__ import annotations
 
 import gc
 from threading import Lock
+from typing import Callable
 
 from PIL import Image
 
-from .config import DETECTION_MODEL
+from .config import DETECTION_MODEL, SECONDARY_DETECTION_MODEL
 
 
 class AnimePersonDetector:
-    """Creates and reuses one explicitly selected isnet-anime session."""
+    """Own the primary anime and optional portrait CUDA sessions."""
 
-    def __init__(self, preferred_device: str = "cpu") -> None:
-        if preferred_device not in {"cpu", "cuda"}:
-            raise ValueError(f"不支援的辨識裝置：{preferred_device}")
-        self.preferred_device = preferred_device
+    def __init__(self) -> None:
         self._session = None
-        self._device = ""
+        self._portrait_session = None
         self._lock = Lock()
 
     @property
@@ -25,64 +23,67 @@ class AnimePersonDetector:
             return self._session is not None
 
     @property
-    def uses_cuda(self) -> bool:
+    def portrait_available(self) -> bool:
         with self._lock:
-            return self._device == "cuda" and self._session is not None
+            return self._portrait_session is not None
+
+    @property
+    def uses_cuda(self) -> bool:
+        return self.initialized
 
     @property
     def device_label(self) -> str:
+        return "本機 GPU（CUDA）" if self.initialized else "尚未準備"
+
+    def initialize(
+        self,
+        portrait_start_callback: Callable[[], None] | None = None,
+    ) -> str | None:
+        """Initialize both models in order; only the portrait model is optional."""
+
+        primary_session = self._create_cuda_session(DETECTION_MODEL)
         with self._lock:
-            if self._device == "cuda":
-                return "本機 GPU（CUDA）"
-            if self._device == "cpu":
-                return "CPU"
-            return "尚未準備"
+            self._session = primary_session
 
-    def initialize(self) -> str | None:
-        """Initialize the preferred provider, visibly falling back only at startup."""
-
-        if self.preferred_device == "cpu":
-            with self._lock:
-                self._session = self._create_cpu_session()
-                self._device = "cpu"
-            return None
-
+        if portrait_start_callback is not None:
+            portrait_start_callback()
         try:
-            session = self._create_cuda_session()
+            portrait_session = self._create_cuda_session(SECONDARY_DETECTION_MODEL)
         except Exception as exc:
-            fallback_reason = str(exc)
             with self._lock:
-                self._session = self._create_cpu_session()
-                self._device = "cpu"
-            return fallback_reason
+                self._portrait_session = None
+            return str(exc)
 
         with self._lock:
-            self._session = session
-            self._device = "cuda"
+            self._portrait_session = portrait_session
         return None
 
     def rebuild_cuda(self) -> None:
-        """Rebuild CUDA once after a runtime failure; never fall back here."""
+        """Rebuild the primary CUDA session once; never switch to CPU mode."""
 
         with self._lock:
             old_session = self._session
             self._session = None
-            self._device = ""
         del old_session
         gc.collect()
-        session = self._create_cuda_session()
+        session = self._create_cuda_session(DETECTION_MODEL)
         with self._lock:
             self._session = session
-            self._device = "cuda"
+
+    def rebuild_portrait_cuda(self) -> None:
+        """Rebuild only the optional portrait CUDA session."""
+
+        with self._lock:
+            old_session = self._portrait_session
+            self._portrait_session = None
+        del old_session
+        gc.collect()
+        session = self._create_cuda_session(SECONDARY_DETECTION_MODEL)
+        with self._lock:
+            self._portrait_session = session
 
     @staticmethod
-    def _create_cpu_session():
-        from rembg import new_session
-
-        return new_session(DETECTION_MODEL, providers=["CPUExecutionProvider"])
-
-    @staticmethod
-    def _create_cuda_session():
+    def _create_cuda_session(model_name: str):
         import onnxruntime as ort
 
         if hasattr(ort, "preload_dlls"):
@@ -92,9 +93,16 @@ class AnimePersonDetector:
 
         from rembg import new_session
 
+        cuda_provider: str | tuple[str, dict[str, str]] = "CUDAExecutionProvider"
+        if model_name == SECONDARY_DETECTION_MODEL:
+            cuda_provider = (
+                "CUDAExecutionProvider",
+                {"cudnn_conv_use_max_workspace": "0"},
+            )
+
         session = new_session(
-            DETECTION_MODEL,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            model_name,
+            providers=[cuda_provider, "CPUExecutionProvider"],
         )
         inner_session = getattr(session, "inner_session", None)
         providers = inner_session.get_providers() if inner_session is not None else []
@@ -103,12 +111,22 @@ class AnimePersonDetector:
         return session
 
     def create_mask(self, image: Image.Image) -> Image.Image:
-        from rembg import remove
-
         with self._lock:
             session = self._session
         if session is None:
             raise RuntimeError("人物辨識器尚未準備完成")
+        return self._create_mask_with_session(image, session)
+
+    def create_portrait_mask(self, image: Image.Image) -> Image.Image:
+        with self._lock:
+            session = self._portrait_session
+        if session is None:
+            raise RuntimeError("二次人物辨識器無法使用")
+        return self._create_mask_with_session(image, session)
+
+    @staticmethod
+    def _create_mask_with_session(image: Image.Image, session: object) -> Image.Image:
+        from rembg import remove
 
         result = remove(
             image.convert("RGB"),

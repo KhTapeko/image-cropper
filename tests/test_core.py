@@ -10,9 +10,11 @@ from image_cropper.core import (
     CropBox,
     GifAnimation,
     UnsupportedAnimatedImageError,
+    add_crop_padding,
     composite_transparency_for_detection,
     estimate_output_bytes,
     gif_sample_indices,
+    is_unreliable_suggested_crop,
     load_gif_animation,
     load_oriented_image,
     mask_to_suggested_crop,
@@ -22,7 +24,7 @@ from image_cropper.core import (
     save_cropped_gif_atomic,
     save_cropped_image,
     scan_input_images,
-    sort_paths_by_creation_desc,
+    sort_paths_by_creation_asc,
     union_crop_boxes,
 )
 
@@ -43,6 +45,20 @@ class CropBoxTests(unittest.TestCase):
         self.assertEqual(box.resize_corner("s", 50, 90, 100, 100), CropBox(20, 20, 80, 90))
         self.assertEqual(box.resize_corner("w", 10, 50, 100, 100), CropBox(10, 20, 80, 80))
         self.assertEqual(box.resize_corner("e", 90, 50, 100, 100), CropBox(20, 20, 90, 80))
+
+    def test_unreliable_crop_uses_unpadded_area_at_inclusive_ninety_five_percent(self) -> None:
+        self.assertTrue(is_unreliable_suggested_crop(None, (100, 100)))
+        self.assertTrue(
+            is_unreliable_suggested_crop(CropBox(0, 0, 95, 100), (100, 100))
+        )
+        self.assertFalse(
+            is_unreliable_suggested_crop(CropBox(0, 0, 94, 100), (100, 100))
+        )
+
+    def test_padding_is_added_only_after_reliability_check(self) -> None:
+        raw = CropBox(3, 10, 97, 90)
+        self.assertFalse(is_unreliable_suggested_crop(raw, (100, 100)))
+        self.assertEqual(add_crop_padding(raw, (100, 100), 0.03), CropBox(0, 7, 100, 93))
 
 
 class OutputScalingTests(unittest.TestCase):
@@ -188,19 +204,19 @@ class GifCropSuggestionTests(unittest.TestCase):
 
 
 class InputScanningTests(unittest.TestCase):
-    def test_creation_time_descending_with_filename_tiebreaker(self) -> None:
+    def test_creation_time_ascending_with_filename_tiebreaker(self) -> None:
         paths = [Path("10.png"), Path("2.png"), Path("new.png")]
         times = {"10.png": 1, "2.png": 1, "new.png": 2}
-        ordered = sort_paths_by_creation_desc(paths, lambda path: times[path.name])
-        self.assertEqual([path.name for path in ordered], ["new.png", "10.png", "2.png"])
+        ordered = sort_paths_by_creation_asc(paths, lambda path: times[path.name])
+        self.assertEqual([path.name for path in ordered], ["10.png", "2.png", "new.png"])
 
-    def test_gifs_are_sorted_after_static_images_with_newest_gif_first(self) -> None:
+    def test_gifs_are_sorted_after_static_images_with_oldest_first(self) -> None:
         paths = [Path("new.gif"), Path("old.png"), Path("old.gif"), Path("new.jpg")]
         times = {"new.gif": 4, "old.png": 1, "old.gif": 2, "new.jpg": 3}
-        ordered = sort_paths_by_creation_desc(paths, lambda path: times[path.name])
+        ordered = sort_paths_by_creation_asc(paths, lambda path: times[path.name])
         self.assertEqual(
             [path.name for path in ordered],
-            ["new.jpg", "old.png", "new.gif", "old.gif"],
+            ["old.png", "new.jpg", "old.gif", "new.gif"],
         )
 
     def test_scanner_ignores_unsupported_files_and_subdirectories(self) -> None:
